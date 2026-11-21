@@ -30,9 +30,84 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ── Step 1: Build and publish images, capture immutable digests ───────────
+  publish:
+    name: Build & publish images
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      # Each output holds the fully-qualified image reference pinned to its
+      # immutable sha256 digest (e.g. ghcr.io/org/linkora-notification@sha256:abc…).
+      # Downstream jobs deploy these references, so retagging the mutable
+      # `staging` tag after publication cannot change the selected build.
+      notification_digest: ${{ steps.digests.outputs.notification }}
+      search_digest:       ${{ steps.digests.outputs.search }}
+      media_digest:        ${{ steps.digests.outputs.media }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - name: notification
+            context: ./services/notification
+            image: ghcr.io/${{ github.repository_owner }}/linkora-notification
+          - name: search
+            context: ./services/search
+            image: ghcr.io/${{ github.repository_owner }}/linkora-search
+          - name: media
+            context: ./services/media
+            image: ghcr.io/${{ github.repository_owner }}/linkora-media
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.service.name }} image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service.context }}
+          push: true
+          # Tag as `staging` (mutable convenience tag) and record the
+          # immutable digest separately — the deploy job uses the digest.
+          tags: ${{ matrix.service.image }}:staging
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Record the digest output keyed by service name.
+      # build-push-action exposes the pushed digest in steps.build.outputs.digest
+      # (sha256:…).  We combine it with the registry image name so the deploy
+      # job has a fully-qualified, immutable reference.
+      - name: Record image digest for ${{ matrix.service.name }}
+        id: digests
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          IMAGE_REF="${{ matrix.service.image }}@${DIGEST}"
+          echo "${{ matrix.service.name }}=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Published ${{ matrix.service.name }}: ${IMAGE_REF}"
+
+  # ── Step 2: Deploy using digest-pinned image references ──────────────────
   deploy:
     name: Deploy microservices to staging
     runs-on: ubuntu-latest
+    needs: publish
 
     environment:
       name: staging
@@ -41,6 +116,22 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      # Report the exact digests that will be deployed so the run log is an
+      # auditable record of what was rolled out.
+      - name: Report digests to be deployed
+        run: |
+          echo "## Staging deployment — image digests" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service | Immutable image reference |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ------- | ------------------------- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| notification | \`${{ needs.publish.outputs.notification_digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| search       | \`${{ needs.publish.outputs.search_digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| media        | \`${{ needs.publish.outputs.media_digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "notification : ${{ needs.publish.outputs.notification_digest }}"
+          echo "search       : ${{ needs.publish.outputs.search_digest }}"
+          echo "media        : ${{ needs.publish.outputs.media_digest }}"
 
       - name: Set up SSH agent
         uses: webfactory/ssh-agent@v0.10.0
@@ -61,7 +152,12 @@ jobs:
           STAGING_DEPLOY_DIR: ${{ vars.STAGING_DEPLOY_DIR }}
           STAGING_SERVICES: ${{ github.event.inputs.services || 'notification search media' }}
           COMPOSE_PROJECT: linkora-staging
-          SKIP_BUILD: ${{ github.event.inputs.skip_build || 'false' }}
+          SKIP_BUILD: "true"
+          # Pass digest-pinned references so the deploy script pulls the
+          # exact builds recorded above rather than resolving a mutable tag.
+          NOTIFICATION_IMAGE: ${{ needs.publish.outputs.notification_digest }}
+          SEARCH_IMAGE:       ${{ needs.publish.outputs.search_digest }}
+          MEDIA_IMAGE:        ${{ needs.publish.outputs.media_digest }}
         run: bash scripts/deploy_staging.sh
 
       - name: Notify deployment status
